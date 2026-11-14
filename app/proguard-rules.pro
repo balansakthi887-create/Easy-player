@@ -1,3 +1,0 @@
--keep class com.maxter.player.data.model.** { *; }
--keepclassmembers class * extends androidx.media3.exoplayer.SimpleExoPlayer { *; }
--dontwarn androidx.media3.**
