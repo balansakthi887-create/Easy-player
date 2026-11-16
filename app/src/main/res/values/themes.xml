@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Compose draws all UI; this theme only styles the window behind it.
+         Uses a platform parent so no extra Material Components dependency is needed. -->
+    <style name="Theme.MaxterPlayer" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/maxter_black</item>
+        <item name="android:statusBarColor">@color/maxter_black</item>
+        <item name="android:navigationBarColor">@color/maxter_black</item>
+        <item name="android:colorAccent">@color/maxter_orange</item>
+    </style>
+</resources>
