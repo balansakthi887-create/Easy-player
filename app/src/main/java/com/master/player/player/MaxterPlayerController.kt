@@ -7,6 +7,8 @@ import android.media.audiofx.Equalizer
 import android.media.audiofx.LoudnessEnhancer
 import android.media.audiofx.Virtualizer
 import android.net.Uri
+import android.os.Handler
+import android.os.Looper
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
@@ -26,11 +28,22 @@ import kotlinx.coroutines.flow.asStateFlow
 @UnstableApi
 class MaxterPlayerController(private val context: Context) {
 
+    private val mainHandler = Handler(Looper.getMainLooper())
+
     private var exoPlayer: ExoPlayer? = null
     private var equalizer: Equalizer? = null
     private var bassBoost: BassBoost? = null
     private var virtualizer: Virtualizer? = null
     private var loudnessEnhancer: LoudnessEnhancer? = null
+
+    // User settings are remembered here so they survive player re-creation
+    // (manual decoder switch or automatic decoder fallback).
+    private var lastEnhanceConfig = SmartEnhanceConfig()
+    private var lastMirror = false
+    private var lastFlip = false
+    private var lastNight = false
+    private var audioBoostPercent = 100
+    private var bassStrength: Short = 0
 
     private val _playerState = MutableStateFlow<ExoPlayer?>(null)
     val playerState: StateFlow<ExoPlayer?> = _playerState.asStateFlow()
@@ -88,32 +101,60 @@ class MaxterPlayerController(private val context: Context) {
             }
 
             override fun onPlayerError(error: PlaybackException) {
-                when (_activeDecoder.value) {
-                    DecoderMode.HW -> {
-                        _decoderStatusMessage.value = "HW decoder unsupported; auto-switched to HW+ fallback."
-                        buildOrRecreatePlayer(DecoderMode.HW_PLUS)
+                // Ignore late errors from a player that has already been replaced.
+                if (exoPlayer !== player) return
+
+                if (isDecoderError(error)) {
+                    when (_activeDecoder.value) {
+                        DecoderMode.HW -> {
+                            _decoderStatusMessage.value =
+                                "HW decoder unsupported; auto-switched to HW+ fallback."
+                            mainHandler.post { buildOrRecreatePlayer(DecoderMode.HW_PLUS) }
+                        }
+                        DecoderMode.HW_PLUS -> {
+                            _decoderStatusMessage.value =
+                                "HW+ decoder fallback triggered; switched to SW mode."
+                            mainHandler.post { buildOrRecreatePlayer(DecoderMode.SW) }
+                        }
+                        DecoderMode.SW -> {
+                            _decoderStatusMessage.value =
+                                "Playback error (${error.errorCodeName}): ${error.localizedMessage ?: "Unsupported media stream"}"
+                        }
                     }
-                    DecoderMode.HW_PLUS -> {
-                        _decoderStatusMessage.value = "HW+ decoder fallback triggered; switched to SW mode."
-                        buildOrRecreatePlayer(DecoderMode.SW)
-                    }
-                    DecoderMode.SW -> {
-                        _decoderStatusMessage.value = "Playback error (${error.errorCodeName}): ${error.localizedMessage ?: "Unsupported media stream"}"
-                    }
+                } else {
+                    // Network / file / permission problems are not fixed by switching decoders.
+                    _decoderStatusMessage.value =
+                        "Playback error (${error.errorCodeName}): ${error.localizedMessage ?: "Cannot play this media"}"
                 }
             }
         })
 
+        exoPlayer = player
+        _playerState.value = player
         _activeDecoder.value = mode
         _decoderStatusMessage.value = "${mode.label} active"
+
+        // The listener above is added after the player is built, so it never receives the
+        // initial audio session id. Attach the audio effects explicitly.
+        attachAudioEffects(player.audioSessionId)
+        setSubtitlesEnabled(_subtitlesEnabled.value)
+        applyVideoEffects(lastEnhanceConfig, lastMirror, lastFlip, lastNight)
+
         if (previousItem != null) {
             player.setMediaItem(previousItem, previousPos)
             player.prepare()
             player.playWhenReady = playWhenReady
         }
-        exoPlayer = player
-        _playerState.value = player
         return player
+    }
+
+    private fun isDecoderError(error: PlaybackException): Boolean = when (error.errorCode) {
+        PlaybackException.ERROR_CODE_DECODER_INIT_FAILED,
+        PlaybackException.ERROR_CODE_DECODER_QUERY_FAILED,
+        PlaybackException.ERROR_CODE_DECODING_FAILED,
+        PlaybackException.ERROR_CODE_DECODING_FORMAT_EXCEEDS_CAPABILITIES,
+        PlaybackException.ERROR_CODE_DECODING_FORMAT_UNSUPPORTED -> true
+        else -> false
     }
 
     fun playVideoUri(uri: Uri, title: String, startPositionMs: Long = 0L, subtitleUri: Uri? = null) {
@@ -158,23 +199,37 @@ class MaxterPlayerController(private val context: Context) {
         flipVertical: Boolean,
         nightMode: Boolean
     ) {
+        lastEnhanceConfig = enhanceConfig
+        lastMirror = mirrorHorizontal
+        lastFlip = flipVertical
+        lastNight = nightMode
+
+        val player = exoPlayer ?: return
+        // Only run the GL effect pipeline when something is actually switched on;
+        // keeping it always active costs GPU/RAM on low-end devices for no visual change.
+        val anyActive = enhanceConfig.enabled || mirrorHorizontal || flipVertical || nightMode
         runCatching {
-            exoPlayer?.setVideoEffects(
-                listOf(
-                    SmartEnhanceGlEffect(
-                        config = enhanceConfig,
-                        mirrorHorizontal = mirrorHorizontal,
-                        flipVertical = flipVertical,
-                        nightModeActive = nightMode
+            if (anyActive) {
+                player.setVideoEffects(
+                    listOf(
+                        SmartEnhanceGlEffect(
+                            config = enhanceConfig,
+                            mirrorHorizontal = mirrorHorizontal,
+                            flipVertical = flipVertical,
+                            nightModeActive = nightMode
+                        )
                     )
                 )
-            )
+            } else {
+                player.setVideoEffects(emptyList())
+            }
         }
     }
 
     fun attachExternalSubtitle(videoUri: Uri, subtitleUri: Uri) {
-        val currentPos = exoPlayer?.currentPosition ?: 0L
-        val playReady = exoPlayer?.playWhenReady ?: true
+        val player = exoPlayer ?: return
+        val currentPos = player.currentPosition
+        val playReady = player.playWhenReady
         val mimeType = inferSubtitleMimeType(subtitleUri.toString())
         val subConfig = MediaItem.SubtitleConfiguration.Builder(subtitleUri)
             .setMimeType(mimeType)
@@ -182,15 +237,17 @@ class MaxterPlayerController(private val context: Context) {
             .setSelectionFlags(C.SELECTION_FLAG_DEFAULT)
             .build()
 
+        // Keep the same mediaId as playVideoUri(), the UI uses it to match the playing item.
         val item = MediaItem.Builder()
             .setUri(videoUri)
+            .setMediaId(videoUri.toString())
             .setSubtitleConfigurations(listOf(subConfig))
             .build()
 
         setSubtitlesEnabled(true)
-        exoPlayer?.setMediaItem(item, currentPos)
-        exoPlayer?.prepare()
-        exoPlayer?.playWhenReady = playReady
+        player.setMediaItem(item, currentPos)
+        player.prepare()
+        player.playWhenReady = playReady
         _decoderStatusMessage.value = "External subtitle loaded (${mimeType.substringAfterLast('/')})"
     }
 
@@ -204,28 +261,41 @@ class MaxterPlayerController(private val context: Context) {
     }
 
     private fun attachAudioEffects(audioSessionId: Int) {
-        if (audioSessionId == C.AUDIO_SESSION_ID_UNSET) return
+        if (audioSessionId == C.AUDIO_SESSION_ID_UNSET || audioSessionId == 0) return
         releaseAudioEffects()
+        // Each effect is created on its own: many devices lack one of them (often Virtualizer),
+        // and a single failure must not stop volume boost / bass boost from working.
+        runCatching { equalizer = Equalizer(0, audioSessionId).apply { enabled = true } }
         runCatching {
-            equalizer = Equalizer(0, audioSessionId).apply { enabled = true }
-            bassBoost = BassBoost(0, audioSessionId).apply { enabled = true }
-            virtualizer = Virtualizer(0, audioSessionId).apply { enabled = true }
-            loudnessEnhancer = LoudnessEnhancer(audioSessionId).apply { enabled = true }
+            bassBoost = BassBoost(0, audioSessionId).apply {
+                enabled = true
+                setStrength(bassStrength)
+            }
+        }
+        runCatching { virtualizer = Virtualizer(0, audioSessionId).apply { enabled = true } }
+        runCatching {
+            loudnessEnhancer = LoudnessEnhancer(audioSessionId).apply {
+                enabled = true
+                setTargetGain(boostGainMillibels())
+            }
         }
     }
+
+    private fun boostGainMillibels(): Int = (audioBoostPercent - 100).coerceAtLeast(0) * 15
 
     fun setEqualizerBandLevel(band: Short, levelMillibels: Short) {
         runCatching { equalizer?.setBandLevel(band, levelMillibels) }
     }
 
     fun setBassBoostStrength(strengthPermille: Short) {
-        runCatching { bassBoost?.setStrength(strengthPermille.coerceIn(0, 1000)) }
+        bassStrength = strengthPermille.coerceIn(0.toShort(), 1000.toShort())
+        runCatching { bassBoost?.setStrength(bassStrength) }
     }
 
     fun setAudioBoostPercent(percent: Int) {
         // Above 100% (up to 200% MX-style volume boost) uses LoudnessEnhancer
-        val gainMb = ((percent - 100).coerceAtLeast(0)) * 15
-        runCatching { loudnessEnhancer?.setTargetGain(gainMb) }
+        audioBoostPercent = percent
+        runCatching { loudnessEnhancer?.setTargetGain(boostGainMillibels()) }
     }
 
     fun probeHardwareDecoders(): List<String> {
@@ -247,6 +317,7 @@ class MaxterPlayerController(private val context: Context) {
     }
 
     fun release() {
+        mainHandler.removeCallbacksAndMessages(null)
         releaseAudioEffects()
         exoPlayer?.release()
         exoPlayer = null
