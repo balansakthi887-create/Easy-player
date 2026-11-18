@@ -1,0 +1,4 @@
+-keep class com.maxter.player.data.model.** { *; }
+-keep class androidx.media3.exoplayer.** { *; }
+-keep class androidx.media3.effect.** { *; }
+-dontwarn androidx.media3.**
