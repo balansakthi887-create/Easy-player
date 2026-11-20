@@ -105,6 +105,14 @@ enum class SortOption(val label: String) {
     SIZE_DESC("Largest Size")
 }
 
+enum class SmartEnhanceLevel(val label: String, val intensity: Float) {
+    OFF("OFF", 0.0f),
+    LOW("LOW", 0.42f),
+    MEDIUM("MEDIUM", 0.72f),
+    HIGH("HIGH", 1.0f),
+    CUSTOM("CUSTOM", 0.80f)
+}
+
 enum class SmartEnhancePreset(
     val label: String,
     val defaultBrightness: Float,
@@ -113,31 +121,61 @@ enum class SmartEnhancePreset(
     val defaultSaturation: Float,
     val defaultDenoise: Float
 ) {
-    AUTO("Auto Mode", 0.02f, 1.14f, 0.50f, 1.15f, 0.25f),
-    LOW_LIGHT("Low-Light Boost", 0.14f, 1.22f, 0.40f, 1.10f, 0.45f),
-    DETAIL("Detail & Crisp", 0.0f, 1.18f, 0.95f, 1.08f, 0.15f),
-    COLOUR("Cinema Vivid", 0.01f, 1.16f, 0.45f, 1.42f, 0.20f),
-    NOISE_REDUCTION("Clean Denoise", 0.0f, 1.06f, 0.25f, 1.05f, 0.80f),
-    CUSTOM("Custom Tuning", 0.0f, 1.12f, 0.45f, 1.15f, 0.25f)
+    AUTO("Auto Mode", 0.03f, 1.18f, 0.75f, 1.22f, 0.25f),
+    LOW_LIGHT("Low-Light Boost", 0.14f, 1.24f, 0.55f, 1.16f, 0.45f),
+    DETAIL("Detail & Crisp", 0.01f, 1.20f, 1.15f, 1.14f, 0.15f),
+    COLOUR("Cinema Vivid", 0.02f, 1.22f, 0.65f, 1.38f, 0.20f),
+    NOISE_REDUCTION("Clean Denoise", 0.01f, 1.10f, 0.40f, 1.10f, 0.78f),
+    CUSTOM("Custom Tuning", 0.02f, 1.16f, 0.65f, 1.20f, 0.25f)
 }
 
 data class SmartEnhanceConfig(
     val enabled: Boolean = false,
+    val level: SmartEnhanceLevel = SmartEnhanceLevel.OFF,
     val isAutoMode: Boolean = true,
     val preset: SmartEnhancePreset = SmartEnhancePreset.AUTO,
     val splitComparisonActive: Boolean = false,
     val splitPosition: Float = 0.5f,
-    val intensity: Float = 0.65f,
-    val brightness: Float = 0.02f,    // -0.5 to +0.5
-    val contrast: Float = 1.14f,      // 0.5 to 2.0
-    val sharpness: Float = 0.50f,     // 0.0 to 1.5 (Unsharp mask / CAS shader kernel)
-    val saturation: Float = 1.15f,    // 0.0 to 2.0
-    val denoise: Float = 0.25f        // 0.0 to 1.0 (Bilateral spatial kernel)
+    val intensity: Float = 0.72f,
+    val brightness: Float = 0.03f,    // -0.4 to +0.4
+    val contrast: Float = 1.18f,      // 0.6 to 1.8
+    val sharpness: Float = 0.75f,     // 0.0 to 1.5 (CAS / unsharp mask)
+    val saturation: Float = 1.22f,    // 0.5 to 1.8 (vibrance-weighted)
+    val denoise: Float = 0.25f        // 0.0 to 1.0 (bilateral spatial)
 ) {
+    fun withLevel(newLevel: SmartEnhanceLevel): SmartEnhanceConfig {
+        return when (newLevel) {
+            SmartEnhanceLevel.OFF -> copy(
+                enabled = false,
+                level = SmartEnhanceLevel.OFF,
+                splitComparisonActive = false
+            )
+            SmartEnhanceLevel.CUSTOM -> copy(
+                enabled = true,
+                level = SmartEnhanceLevel.CUSTOM,
+                preset = SmartEnhancePreset.CUSTOM
+            )
+            else -> copy(
+                enabled = true,
+                level = newLevel,
+                intensity = newLevel.intensity
+            )
+        }
+    }
+
     fun withPreset(newPreset: SmartEnhancePreset): SmartEnhanceConfig {
+        val nextLevel = when {
+            !enabled -> SmartEnhanceLevel.MEDIUM
+            newPreset == SmartEnhancePreset.CUSTOM -> SmartEnhanceLevel.CUSTOM
+            level == SmartEnhanceLevel.OFF -> SmartEnhanceLevel.MEDIUM
+            else -> level
+        }
         return copy(
+            enabled = true,
+            level = nextLevel,
             preset = newPreset,
             isAutoMode = newPreset == SmartEnhancePreset.AUTO,
+            intensity = if (nextLevel == SmartEnhanceLevel.CUSTOM) intensity else nextLevel.intensity,
             brightness = newPreset.defaultBrightness,
             contrast = newPreset.defaultContrast,
             sharpness = newPreset.defaultSharpness,
@@ -145,4 +183,6 @@ data class SmartEnhanceConfig(
             denoise = newPreset.defaultDenoise
         )
     }
+
+    fun resetToDefault(): SmartEnhanceConfig = SmartEnhanceConfig()
 }
